@@ -53,6 +53,16 @@ class Settings(BaseSettings):
     stripe_publishable_key: Optional[str] = None
     stripe_webhook_secret: Optional[str] = None
     
+    # Licensing Server Configuration
+    licensing_server_url: str = "http://licensing-server:8001"
+    licensing_api_key: str = "licensing-api-key-change-in-production"
+    
+    # Multi-tenant Configuration
+    enable_multi_tenancy: bool = True
+    default_organization_name: str = "Default Organization"
+    trial_days: int = 14
+    max_organizations: int = 1000
+    
     # Video Conferencing
     video_conferencing_enabled: bool = False
     zoom_api_key: Optional[str] = None

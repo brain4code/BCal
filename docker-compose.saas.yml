@@ -1,0 +1,221 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database for main application
+  postgres:
+    image: postgres:15
+    container_name: bcal_postgres_saas
+    environment:
+      POSTGRES_DB: bcal_db
+      POSTGRES_USER: bcal_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bcal_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bcal_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bcal_user -d bcal_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Database for licensing server
+  postgres_licensing:
+    image: postgres:15
+    container_name: bcal_postgres_licensing
+    environment:
+      POSTGRES_DB: license_db
+      POSTGRES_USER: license_user
+      POSTGRES_PASSWORD: ${LICENSING_POSTGRES_PASSWORD:-license_password}
+    volumes:
+      - postgres_licensing_data:/var/lib/postgresql/data
+    networks:
+      - bcal_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U license_user -d license_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for caching and sessions
+  redis:
+    image: redis:7-alpine
+    container_name: bcal_redis_saas
+    networks:
+      - bcal_network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  # Licensing Server
+  licensing-server:
+    build:
+      context: ./licensing-server
+      dockerfile: Dockerfile
+    container_name: bcal_licensing_server
+    environment:
+      - DATABASE_URL=postgresql://license_user:${LICENSING_POSTGRES_PASSWORD:-license_password}@postgres_licensing:5432/license_db
+      - LICENSE_SERVER_SECRET=${LICENSE_SERVER_SECRET:-licensing-secret-key-change-in-production}
+      - LICENSING_API_KEY=${LICENSING_API_KEY:-licensing-api-key-change-in-production}
+    depends_on:
+      postgres_licensing:
+        condition: service_healthy
+    networks:
+      - bcal_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bcal_backend_saas
+    environment:
+      - DATABASE_URL=postgresql://bcal_user:${POSTGRES_PASSWORD:-bcal_password}@postgres:5432/bcal_db
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=30
+      - DEBUG=false
+      
+      # Multi-tenancy
+      - ENABLE_MULTI_TENANCY=true
+      - DEFAULT_ORGANIZATION_NAME=Default Organization
+      - TRIAL_DAYS=14
+      - MAX_ORGANIZATIONS=1000
+      
+      # Licensing
+      - LICENSING_SERVER_URL=http://licensing-server:8001
+      - LICENSING_API_KEY=${LICENSING_API_KEY:-licensing-api-key-change-in-production}
+      
+      # Stripe
+      - STRIPE_ENABLED=${STRIPE_ENABLED:-false}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      
+      # Email
+      - EMAIL_ENABLED=${EMAIL_ENABLED:-false}
+      - EMAIL_HOST=${EMAIL_HOST:-smtp.gmail.com}
+      - EMAIL_PORT=${EMAIL_PORT:-587}
+      - EMAIL_USERNAME=${EMAIL_USERNAME}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD}
+      - EMAIL_FROM=${EMAIL_FROM:-noreply@bcal.com}
+      - EMAIL_USE_TLS=true
+      
+      # Redis
+      - REDIS_URL=redis://redis:6379/0
+      
+    depends_on:
+      postgres:
+        condition: service_healthy
+      licensing-server:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - bcal_network
+    restart: unless-stopped
+    volumes:
+      - uploads_data:/app/uploads
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        - REACT_APP_API_URL=/api
+        - REACT_APP_STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY}
+        - REACT_APP_ENABLE_MULTI_TENANCY=true
+    container_name: bcal_frontend_saas
+    networks:
+      - bcal_network
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: bcal_nginx_saas
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.saas.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - uploads_data:/var/www/uploads:ro
+    depends_on:
+      - backend
+      - frontend
+      - licensing-server
+    networks:
+      - bcal_network
+    restart: unless-stopped
+
+  # Background Workers
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bcal_worker_saas
+    environment:
+      - DATABASE_URL=postgresql://bcal_user:${POSTGRES_PASSWORD:-bcal_password}@postgres:5432/bcal_db
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - LICENSING_SERVER_URL=http://licensing-server:8001
+      - LICENSING_API_KEY=${LICENSING_API_KEY:-licensing-api-key-change-in-production}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - EMAIL_ENABLED=${EMAIL_ENABLED:-false}
+      - EMAIL_HOST=${EMAIL_HOST:-smtp.gmail.com}
+      - EMAIL_USERNAME=${EMAIL_USERNAME}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      licensing-server:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - bcal_network
+    restart: unless-stopped
+    command: python -m app.workers.main
+
+  # Monitoring and Health Checks
+  healthcheck:
+    image: alpine/curl
+    container_name: bcal_healthcheck
+    networks:
+      - bcal_network
+    restart: unless-stopped
+    command: |
+      sh -c '
+        while true; do
+          echo "$(date): Checking services health..."
+          curl -f http://backend:8000/health || echo "Backend unhealthy"
+          curl -f http://licensing-server:8001/health || echo "Licensing server unhealthy"
+          sleep 60
+        done
+      '
+
+volumes:
+  postgres_data:
+    driver: local
+  postgres_licensing_data:
+    driver: local
+  redis_data:
+    driver: local
+  uploads_data:
+    driver: local
+
+networks:
+  bcal_network:
+    driver: bridge
